@@ -1,0 +1,17 @@
+[Unit]
+Description=YunoDSH local DSH runtime
+After=network.target
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+WorkingDirectory=@PROJECT_ROOT@
+Environment="PATH=@NODE_DIR@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart="@NODE_BIN@" "@PROJECT_ROOT@/scripts/project.mjs" dsh
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

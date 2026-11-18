@@ -1,0 +1,19 @@
+{
+  "reviewedOn": "2026-11-13",
+  "repositories": [
+    {
+      "name": "deepseek-harness",
+      "url": "https://github.com/deepseek-ai/deepseek-harness.git",
+      "path": "upstream/deepseek-harness",
+      "branchAtReview": "master",
+      "commit": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb"
+    },
+    {
+      "name": "dc-bridge",
+      "url": "https://github.com/konnokai/dc-bridge.git",
+      "path": "upstream/dc-bridge",
+      "branchAtReview": "main",
+      "commit": "a393a5bc557f26277e41c1309b60b481cfd3bec8"
+    }
+  ]
+}

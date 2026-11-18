@@ -1,0 +1,35 @@
+{
+  "purpose": "Requirement decisions and acceptance tracking; this file is not runtime configuration.",
+  "handover": "docs/DSH_Discord_Bridge_Codex_Handover.md",
+  "decisions": {
+    "persona": { "mode": "user-managed-dc-chat", "status": "edited-source-synchronized-and-live-preset-verified" },
+    "personalMemory": {
+      "identity": "discord-user-id",
+      "guildScope": "shared-across-servers",
+      "privateDmContext": "separate"
+    },
+    "channelDigest": {
+      "intervalMinutes": 60,
+      "onlyWhenNewMessagesExist": true,
+      "status": "implemented-and-recovery-tested-offline; live-discord-and-model-validation-pending"
+    }
+  },
+  "implementedCapabilities": [
+    "owner-dm-text-reply-user-confirmed-working",
+    "journaled-observed-input-and-frozen-dsh-request-recovery",
+    "hourly-incremental-digest-with-persisted-input-and-idempotent-note-export",
+    "source-references-on-new-memory-and-note-writes",
+    "bounded-media-downloads-and-processing",
+    "single-background-session-at-a-time"
+  ],
+  "remainingRequirements": [
+    "live-group-media-memory-digest-and-restart-validation",
+    "gateway-downtime-backfill-and-durable-outbound-event-gap-recovery",
+    "semantic-memory-attribution-and-legacy-source-coverage",
+    "flash-default-and-explicit-flagship-routing-through-dsh",
+    "owner-dm-private-assistant-and-coding",
+    "target-debian-systemd-and-1gb-resource-validation"
+  ],
+  "deferredDecisions": ["policy-layer", "final-deployment-topology"],
+  "currentFocus": "working-dm-mvp; release-gap review requested"
+}

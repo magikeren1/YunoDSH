@@ -1,0 +1,5 @@
+{
+  "dsh": { "baseUrl": "http://127.0.0.1:3080" },
+  "stateDir": "state",
+  "tmpDir": "tmp"
+}
