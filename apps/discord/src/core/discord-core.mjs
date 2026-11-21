@@ -91,6 +91,8 @@ export function normalizeDiscordConfig(raw) {
     agentPreset: text(src.agentPreset, 'dc-chat'),
     workspaceTitle: text(src.workspaceTitle, 'Discord 聊天'),
     ownerIds: idList(src.ownerIds, 'discord.ownerIds'),
+    ownerChangesGuildId: src.ownerChangesGuildId
+      ? idList([src.ownerChangesGuildId], 'discord.ownerChangesGuildId')[0] : '',
     allow: {
       guilds: idList(src.allow?.guilds, 'discord.allow.guilds'),
       channels: idList(src.allow?.channels, 'discord.allow.channels'),
@@ -674,6 +676,8 @@ const PROGRESS_LABELS = {
   'mcp__discord__search_history': ['🔎 搜尋聊天紀錄', (args) => args.query],
   'mcp__discord__view_message': ['🔎 看一則訊息'],
   'mcp__discord__review_video': ['🎬 分析影片'],
+  'mcp__discord__owner_project': ['📄 查看專案'],
+  'mcp__discord__propose_owner_change': ['📝 準備變更'],
   'mcp__discord__user_info': ['👤 查看群友資料'],
   'mcp__discord__server_info': ['🏠 查看伺服器資訊'],
   'mcp__discord__conversation_stats': ['📊 查對話次數'],

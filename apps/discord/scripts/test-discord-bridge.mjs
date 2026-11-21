@@ -144,6 +144,7 @@ const baseCfg = () => normalizeDiscordConfig({});
 const DISCORD_TOOL_NAMES = [
   'send_message', 'send_image', 'cancel_image', 'send_prts_artwork', 'get_prts_artwork', 'send_sticker', 'add_reaction', 'remove_reaction', 'set_quiet', 'set_custom_status', 'ignore_user', 'schedule_followup', 'edit_message', 'delete_message', 'create_poll',
   'search_emojis', 'search_stickers', 'search_gifs', 'run_script', 'read_history', 'search_history', 'view_message', 'review_video',
+  'owner_project', 'propose_owner_change',
   'user_info', 'server_info', 'conversation_stats', 'remember_user', 'forget_user_fact',
   'note_event', 'search_notes', 'forget_note', 'propose_knowledge', 'save_meme', 'search_memes', 'forget_meme',
   'submit_feedback', 'list_feedback', 'edit_feedback',
@@ -3459,6 +3460,8 @@ console.log('## 7e. Discord MCP 發送工具');
       create_poll: ['/poll', { question: '吃什麼', answers: ['拉麵', '咖哩'] }],
       search_history: ['/search', { query: '期末考' }],
       view_message: ['/view', { message: '#k7f3ab', channel: '123456789012345678' }],
+      owner_project: ['/ownerProject', { file: 'README.md', start_line: 12 }],
+      propose_owner_change: ['/proposeOwnerChange', { kind: 'project', operation: 'create', file: 'example.md', after: 'example' }],
       remember_user: ['/remember', { message: '#k7f3ab', name: '小明', fact: '在準備考試' }],
       forget_user_fact: ['/forget-fact', { message: '#k7f3ab', number: 1 }],
       note_event: ['/note', { text: '週五晚上約好一起打牌' }],

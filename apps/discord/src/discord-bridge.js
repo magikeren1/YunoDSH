@@ -226,6 +226,10 @@ import {
 import { resolvePrtsArtwork } from './core/prts-artwork.mjs';
 import { fetchVideoLink, formatChapters, formatVideoTime, isBilibiliVideoLink, videoLinks } from './core/discord-video-link.mjs';
 import { reviewVideoLink } from './core/discord-video-review.mjs';
+import {
+  applyOwnerProjectChange, createOwnerChangeQueue, inspectOwnerProject, isOwnerDm,
+  ownerChangeDecision, prepareOwnerDiscordChange, prepareOwnerProjectChange,
+} from './core/discord-owner-changes.mjs';
 import { fetchTwitterImage, fetchTwitterPost, firstTwitterPost, twitterImageUrls, twitterPostLines } from './core/twitter-post.mjs';
 import { searchGifs, GIF_QUERY_MAX, GIF_RATINGS } from './core/discord-gif.mjs';
 import { resolveConsoleToken, startConsole } from './core/discord-console.mjs';
@@ -252,6 +256,7 @@ import { resolvePriceTable } from './model-prices.js';
 import { truncateText } from './md-to-plain.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PROJECT_ROOT = path.resolve(ROOT, '../..');
 const STATE_DIR = path.join(ROOT, 'state');
 const CONFIG_FILE = path.join(ROOT, 'config.json');
 const SESSIONS_FILE = path.join(STATE_DIR, 'discord-sessions.json');
@@ -931,6 +936,7 @@ async function main() {
   }
 
   const ownerIds = new Set(cfg.discord.ownerIds);
+  const ownerChanges = createOwnerChangeQueue();
   // 管理員永遠不算被不理：就算檔案被手改，也不讓模型或設定把 ownerIds 擋掉。
   const ignoredUser = (userId) => {
     const id = String(userId ?? '');
@@ -1479,6 +1485,50 @@ async function main() {
 
   const toolError = (message, statusCode) => Object.assign(new Error(message), { statusCode });
 
+  async function ownerChangeContext(token) {
+    const resolved = await agentSender.resolve(token);
+    const userId = resolved.kind === 'dm' ? resolved.key.slice(3) : '';
+    if (!cfg.discord.ownerChangesGuildId || resolved.channel?.type !== ChannelType.DM
+      || !isOwnerDm({ key: resolved.key, guildId: resolved.channel.guildId, userId, ownerIds })
+      || !turnUsers.get(resolved.key)?.some((user) => user.userId === userId)) {
+      throw toolError('擁有者變更工具只在經驗證的擁有者私訊回合使用', 403);
+    }
+    return { ...resolved, userId };
+  }
+
+  async function checkOwnerDiscordScope(plan, userId) {
+    const scopedGuild = cfg.discord.ownerChangesGuildId;
+    const target = plan.channelId ? await client.channels.fetch(plan.channelId, { force: true }).catch(() => null) : null;
+    if (!scopedGuild || (plan.guildId ?? target?.guildId) !== scopedGuild) {
+      throw toolError('目標不在擁有者私訊開放管理的伺服器', 403);
+    }
+    const guild = await client.guilds.fetch(scopedGuild);
+    const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+    if (!member?.permissions.has(PermissionFlagsBits.Administrator)) {
+      throw toolError('Discord 帳號需要有目標伺服器的 Administrator 權限', 403);
+    }
+  }
+
+  async function decideOwnerChange(key, userId, { approved, code }) {
+    const plan = ownerChanges.consume(key, sessions[key], code);
+    if (!plan) return sendLong(key, '找不到可確認的變更，可能已逾時、使用過或重開會話。');
+    if (!approved) return sendLong(key, '已拒絕變更。');
+    try {
+      if (plan.kind === 'project') applyOwnerProjectChange(PROJECT_ROOT, plan);
+      else {
+        await checkOwnerDiscordScope(plan, userId);
+        const { method, route, data } = plan.preview;
+        await client.rest[method.toLowerCase()](route, { body: data, reason: 'Owner-approved YunoDSH change' });
+      }
+    } catch (error) {
+      const detail = plan.kind === 'discord' && error.status
+        ? `Discord HTTP ${error.status}${error.code ? `（${error.code}）` : ''}`
+        : error.path ? `主機檔案操作失敗（${error.code}）` : error.message;
+      return sendLong(key, `變更未完成：${flat(detail, 180)}。`);
+    }
+    log(`Owner change applied: ${plan.kind} ${code}`);
+    return sendLong(key, '已套用這筆變更。');
+  }
   const HISTORY_MAX = 50;
   const HISTORY_MAX_CHARS = 6000;
   const GIF_COOLDOWN_MS = 15 * 60_000; // GIPHY 回 429 後先停 15 分鐘，冷卻期間不再打 GIPHY
@@ -2774,6 +2824,31 @@ async function main() {
       });
       if (result.error) throw toolError(result.error, 400);
       return result;
+    },
+    async ownerProject(body) {
+      await ownerChangeContext(body.token);
+      return { text: inspectOwnerProject(PROJECT_ROOT, body) };
+    },
+    async proposeOwnerChange(body) {
+      const { key, sessionId, userId } = await ownerChangeContext(body.token);
+      let plan;
+      if (body.kind === 'project') plan = prepareOwnerProjectChange(PROJECT_ROOT, body);
+      else if (body.kind === 'discord') {
+        plan = prepareOwnerDiscordChange(body);
+        await checkOwnerDiscordScope(plan, userId);
+      } else throw toolError('請指定專案或 Discord 變更', 400);
+      const code = ownerChanges.stage(key, sessionId, plan);
+      try {
+        const summary = plan.kind === 'project' ? `${plan.preview.operation} ${plan.preview.file}`
+          : `${plan.preview.method} ${plan.preview.route}`;
+        await sendLong(key, `變更提案 ${flat(summary, 220)}\n請查閱附件中的完整提案。確認：\`/approve-change ${code}\`\n取消：\`/reject-change ${code}\`（10 分鐘內）`, {
+          file: { buffer: Buffer.from(`${JSON.stringify(plan.preview, null, 2)}\n`), name: 'owner-change.json' },
+        });
+      } catch (error) {
+        ownerChanges.consume(key, sessionId, code);
+        throw error;
+      }
+      return { text: '已把完整提案送到擁有者私訊，待擁有者確認後才會執行。' };
     },
     async view(body) {
       const viewStart = Date.now();
@@ -5517,6 +5592,14 @@ async function main() {
       && shouldHandleGuildMessage({ mentionedUserIds: mentioned, repliedUserId }, client.user.id, true);
     if (!isConversationAllowed(cfg.discord, ids)) return;
     const key = conversationKeyFor(ids);
+    if (cfg.discord.ownerChangesGuildId && !recovering
+      && message.channel?.type === ChannelType.DM && isOwnerDm({ ...ids, key, ownerIds })) {
+      const ownerDecision = ownerChangeDecision(message.content);
+      if (ownerDecision) {
+        await decideOwnerChange(key, message.author.id, ownerDecision);
+        return;
+      }
+    }
     if (!addressedToBot && cfg.discord.deny.self.includes(message.author.id)) {
       // 記下這則還沒被上下文帶到：下一批若沒涵蓋它（它在批次最後一則之後），會再重帶一次。
       primedKeys.delete(key);

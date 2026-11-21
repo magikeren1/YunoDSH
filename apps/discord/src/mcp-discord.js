@@ -388,6 +388,37 @@ tool(
 );
 
 tool(
+  'owner_project',
+  '只用於真正的機器人擁有者私訊。擁有者要求處理本專案時，可搜尋檔名或讀取 UTF-8 來源檔。file 可省略；有 file 時用 start_line 翻頁。',
+  {
+    token: sessionToken,
+    file: z.string().max(250).optional(),
+    query: z.string().max(120).optional(),
+    start_line: z.number().int().positive().optional(),
+  },
+  '/ownerProject',
+  (result) => String(result.text ?? ''),
+);
+
+tool(
+  'propose_owner_change',
+  '只在真正的擁有者私訊中、擁有者明確要求時，用來提案修改本專案或指定 Discord 伺服器。專案支援 create（file/after）、replace（file/before/after，before 要逐字吻合且唯一）、delete（file）。Discord 給 method、相對 API route 和 JSON data，例如 PATCH /channels/<id> 的 topic。橋接會交給擁有者確認，提案本身尚未執行。',
+  {
+    token: sessionToken,
+    kind: z.enum(['project', 'discord']),
+    operation: z.enum(['create', 'replace', 'delete']).optional(),
+    file: z.string().max(250).optional(),
+    before: z.string().max(28_000).optional(),
+    after: z.string().max(28_000).optional(),
+    method: z.enum(['POST', 'PATCH', 'PUT', 'DELETE']).optional(),
+    route: z.string().max(250).optional(),
+    data: z.record(z.string(), z.unknown()).optional(),
+  },
+  '/proposeOwnerChange',
+  (result) => String(result.text ?? ''),
+);
+
+tool(
   'user_info',
   '查某則訊息的發言者：顯示名稱、使用者名稱、身分組、加入伺服器時間、加成與禁言狀態、你記得的關於他的事，並附上他的頭像圖片。',
   {

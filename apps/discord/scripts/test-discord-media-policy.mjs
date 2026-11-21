@@ -6,6 +6,7 @@ import { normalizeDiscordConfig, canAnalyzeMedia, shouldHandleGuildMessage,
   stripBotMention, conversationKeyFor, isConversationAllowed,
 } from '../src/core/discord-core.mjs';
 import { collectMediaAttachments, embedImages, stickerImages, stickerLabel } from '../src/core/discord-media.mjs';
+import { isOwnerDm, ownerChangeDecision } from '../src/core/discord-owner-changes.mjs';
 
 const source = fs.readFileSync(new URL('../src/discord-bridge.js', import.meta.url), 'utf8');
 const BOT = '123456789012345678';
@@ -133,4 +134,20 @@ assert.equal((await view({})).images.length, 1, 'DM view_message stays unrestric
 cfg.discord.media.requireMentionInGuild = false;
 entries = await receive({});
 assert.equal(entries[0].media.accepted.length, 1, 'disabling the switch restores automatic channel images');
+const approvals = [];
+Object.assign(context, { ChannelType: { DM: 1 }, isOwnerDm, ownerChangeDecision,
+  decideOwnerChange: async (...args) => approvals.push(args) });
+cfg.discord.ownerChangesGuildId = GUILD;
+const approval = { text: '/approve-change 123456789abc', attachment: false };
+await intake({ ...message(approval), channel: { id: CHANNEL, type: 0 } });
+const dmApproval = { ...message({ ...approval, dm: true }), channel: { id: CHANNEL, type: 1 } };
+await intake(dmApproval);
+assert.equal(approvals.length, 0, 'a guild message or nonowner DM cannot approve a change');
+context.ownerIds.add(USER);
+await intake(dmApproval, { recovering: true });
+assert.equal(approvals.length, 0, 'recovered input cannot approve an owner change');
+await intake(dmApproval);
+assert.equal(approvals.length, 1, 'only the live owner DM reaches the approval handler');
+assert.equal(approvals[0][0], `dm:${USER}`);
+assert.equal(approvals[0][2].code, '123456789abc');
 console.log('Media policy: intake, mixed batches, previews, view_message, DMs and rollback passed.');
