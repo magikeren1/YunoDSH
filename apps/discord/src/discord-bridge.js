@@ -63,7 +63,7 @@ import {
 } from './core/discord-core.mjs';
 import { OPENING_HINT, componentParts, embedIsSensitive, formatBlacklistStatus, formatQuote, formatRecentContext, formatTimeContext, guildBlacklistNames, linkPaths, messageParts, parseHistoryDate, referencedMessage, visibleAttachments, warmMemberCache } from './core/discord-context.mjs';
 import { bySnowflake, collectSearchHits, guildSearchParams, orderSearchHits, scanHistoryMessages, SEARCH_PAGE_MAX } from './core/discord-history.mjs';
-import { createRefusalTracker, formatIgnoreUntil, ignoreList, isIgnoring, isRefusalMessage, loadIgnoreFile, saveIgnoreFile, setIgnored, unignore, IGNORE_MAX_MINUTES, IGNORE_MAX_USERS } from './core/discord-ignore.mjs';
+import { createRefusalTracker, formatIgnoreUntil, ignoreList, isIgnoring, isRefusalMessage, loadIgnoreFile, refusalMarkerCategory, saveIgnoreFile, setIgnored, unignore, IGNORE_MAX_MINUTES, IGNORE_MAX_USERS } from './core/discord-ignore.mjs';
 import { createActivityTracker, formatActivityLine } from './core/discord-activity.mjs';
 import { createQuoteProvider } from './core/quote-provider.mjs';
 import { openTradeDb } from './core/discord-trade-db.mjs';
@@ -1272,6 +1272,8 @@ async function main() {
     turnDirect.delete(key);
     pendingDirectMessages.delete(key);
     turnDirectMessages.delete(key);
+    politicalAsks.delete(key);
+    politicalGrants.delete(key);
     turnStartedAt.delete(key);
     turnFollowupTaken.delete(key);
     turnFollowupHeld.delete(key);
@@ -1970,25 +1972,29 @@ async function main() {
     const attached = (typeof body.file === 'string' && body.file.trim())
       || (typeof body.sticker === 'string' && body.sticker.trim());
     if (attached || !isRefusalMessage(content)) return null;
-    const { key } = await agentSender.resolve(body.token);
+    const { key, channel } = await agentSender.resolve(body.token);
 
     // 回應對象只認這一輪的觸發訊息；reply_to 指到哪一則就用那一則的作者。
     const directMessages = turnDirectMessages.get(key) ?? [];
     const replyTo = textArg(body.reply_to);
+    const targetId = replyTo ? messageRefs.lookup(key, replyTo) : null;
+    const trigger = replyTo ? directMessages.find((entry) => entry.id === targetId) : directMessages.at(-1);
+    if (channel.guildId && trigger?.text?.trim() && refusalMarkerCategory(content) === '政治'
+      && !activePoliticalEntry(politicalAsks, key) && !activePoliticalEntry(politicalGrants, key)) {
+      return { politicalAsk: { question: trigger.text, messageId: trigger.id, epoch: epochOf(key) } };
+    }
     let userId = '';
     let target = replyTo;
     if (replyTo) {
-      const targetId = messageRefs.lookup(key, replyTo);
-      userId = directMessages.find((entry) => entry.id === targetId)?.userId ?? '';
+      userId = trigger?.userId ?? '';
       if (!userId && targetId) {
         const message = await fetchByRef(key, replyTo).catch(() => null);
         userId = message?.author?.id ?? '';
       }
     } else {
-      const latest = directMessages.at(-1);
-      if (!latest) return null;
-      userId = latest.userId;
-      target = messageRefs.register(key, latest.id);
+      if (!trigger) return null;
+      userId = trigger.userId;
+      target = messageRefs.register(key, trigger.id);
     }
     if (!userId || userId === client.user.id) return null;
 
@@ -2011,6 +2017,27 @@ async function main() {
     // Keep follow-up messages in their durable prompt batch. Returning them only
     // through an in-flight tool response has no replayable admission receipt.
     return null;
+  }
+
+  // 政治特許：管理員在頻道同意後，這個會話最多再答 10 回合政治；否決則維持拒絕 10 回合。
+  const POLITICAL_GRANT_TURNS = 10;
+  const POLITICAL_ASK_TTL_MS = 30 * 60_000;
+  const POLITICAL_GRANT_TTL_MS = 2 * 60 * 60_000;
+  const politicalAsks = new Map();
+  const politicalGrants = new Map();
+
+  function activePoliticalEntry(entries, key) {
+    const entry = entries.get(key);
+    if (entry && entry.expiresAt > Date.now() && entry.remaining !== 0) return entry;
+    if (entry) entries.delete(key);
+    return null;
+  }
+
+  function politicalHint(grant) {
+    if (!grant) return '';
+    return grant.allowed
+      ? `【本輪政治審批】管理員已同意回答這個話題，含本輪還可回答 ${grant.remaining} 回合。`
+      : `【本輪政治審批】管理員已否決，含本輪還有 ${grant.remaining} 回合維持拒絕，不用再問管理員。`;
   }
 
   const sendMessage = createAgentSendHandler({
@@ -2490,6 +2517,11 @@ async function main() {
       if (refusal?.replaced) return refusal.replaced;
       // 梗圖不是畫出來的，不計繪圖次數。
       const result = await sendMessage(body, { draw: !freshSpeech });
+      const ask = refusal?.politicalAsk;
+      if (ask && result.refs?.length && ask.epoch === epochOf(key)
+        && !activePoliticalEntry(politicalAsks, key) && !activePoliticalEntry(politicalGrants, key)) {
+        politicalAsks.set(key, { ...ask, expiresAt: Date.now() + POLITICAL_ASK_TTL_MS });
+      }
       // 真的送出成功才累加：第一則失敗時，下一次仍然是第一次拒絕。
       if (refusal?.note) refusals.note(refusal.note.key, refusal.note.userId);
       return result;
@@ -4733,28 +4765,32 @@ async function main() {
     }
     if (job.direct) startTyping(key, job.channel);
 
-    const prompt = job.text
-      ? { text: job.text, images: [], feedbackEntries: [] }
-      : job.reminder
-        ? { text: job.reminder, images: [], feedbackEntries: [] }
-        : job.followup
-          ? {
-            // 回訪沒有【新訊息】，只有這幾行：先校正黑名單，再給回訪提示。
-            // 少了黑名單，模型會拿舊 prompt 的名單去 @ 已經退出的人。
-            // 回訪可能隔好幾天，沒有【現在】模型就判斷不出「比賽是不是今天」。
-            text: [
-              job.channel?.guild ? formatBlacklistStatus(guildBlacklistNames(cfg.discord.deny.self, job.channel.guild)) : '',
-              formatFollowupPrompt(job.followup, { openTopic: isChattyChannel(cfg.discord, job.channel?.id) }),
-              formatTimeContext(),
-            ].filter(Boolean).join('\n'),
-            images: [],
-            feedbackEntries: [],
-          }
-          : await buildBatchPrompt(key, job);
+    const approval = job.politicalApproval;
+    const reminder = approval
+      ? `請回答原問題 #${messageRefs.register(key, approval.ask.messageId)}：\n  ${defang(approval.ask.question).replace(/\n/g, '\n  ')}`
+      : job.reminder;
+    const prompt = job.text || reminder
+      ? { text: job.text || reminder, images: [], feedbackEntries: [] }
+      : job.followup
+      ? {
+        // 回訪沒有【新訊息】，只有這幾行：先校正黑名單，再給回訪提示。
+        // 少了黑名單，模型會拿舊 prompt 的名單去 @ 已經退出的人。
+        // 回訪可能隔好幾天，沒有【現在】模型就判斷不出「比賽是不是今天」。
+        text: [
+          job.channel?.guild ? formatBlacklistStatus(guildBlacklistNames(cfg.discord.deny.self, job.channel.guild)) : '',
+          formatFollowupPrompt(job.followup, { openTopic: isChattyChannel(cfg.discord, job.channel?.id) }),
+          formatTimeContext(),
+        ].filter(Boolean).join('\n'),
+        images: [],
+        feedbackEntries: [],
+      }
+      : await buildBatchPrompt(key, job);
     if (epoch !== epochOf(key)) {
       log(`整理批次期間會話已重置，丟棄 (${key})`);
       return false;
     }
+    const grant = approval || job.entries.length ? activePoliticalEntry(politicalGrants, key) : null;
+    if (approval && grant !== approval.grant) return false;
 
     // 令牌由 DSH 外掛自動帶入，不再寫進 prompt：模型看不到，被注入也抄不走。
     // 每輪還是要提醒一次「文字不會自動送出」，壓縮過上下文之後也不能忘。
@@ -4768,7 +4804,8 @@ async function main() {
     const opening = needsOpening.has(key) && job.direct ? `\n${OPENING_HINT}` : '';
     // 回訪清單只給「會說話的回合」：NO_TOOL 提醒與系統訊息不需要，多一行只是雜訊。
     const schedule = job.reminder || job.system ? '' : formatFollowupStatus(followups.list(key));
-    const text = `${reload ? `${formatReloadSummary(reload)}\n` : ''}${prompt.text}${opening}\n${schedule ? `${schedule}\n` : ''}${sendHint}`;
+    const text = [reload ? formatReloadSummary(reload) : '', politicalHint(grant),
+      `${prompt.text}${opening}`, schedule, sendHint].filter(Boolean).join('\n');
     // 先排進去：這一批的 turn/start 可能比 prompt 的回應更早到。沒產生回合時再拿掉。
     const queued = pendingDirect.get(key) ?? [];
     queued.push(job.direct);
@@ -4779,7 +4816,7 @@ async function main() {
     pendingUsers.set(key, queuedUsers);
     const directMessages = job.entries
       .filter((entry) => entry.direct)
-      .map((entry) => ({ userId: entry.userId, id: entry.id, addressedToBot: entry.addressedToBot === true }));
+      .map((entry) => ({ userId: entry.userId, id: entry.id, addressedToBot: entry.addressedToBot === true, text: entry.rawText ?? entry.text }));
     const queuedMessages = pendingDirectMessages.get(key) ?? [];
     queuedMessages.push(directMessages);
     pendingDirectMessages.set(key, queuedMessages);
@@ -4817,6 +4854,7 @@ async function main() {
       throw new Error(`${error?.code ?? '未知錯誤'}${error?.message ? `：${error.message}` : ''}`);
     }
     journal.accept(job.requestId);
+    if (grant && politicalGrants.get(key) === grant && --grant.remaining === 0) politicalGrants.delete(key);
     liveRequests.delete(job.requestId);
     for (const entry of job.entries) queuedIngress.delete(entry.id);
     // 還有「只當背景」的訊息沒被上下文涵蓋時不要標記，下一批會再重帶一次。
@@ -5639,6 +5677,29 @@ async function main() {
       return;
     }
     if (!observed && !recovering) return;
+    const isOwner = ownerIds.has(message.author.id);
+    const verdict = rawText.trim();
+    if (guildId && isOwner && !recovering && (verdict === '准' || verdict === '拒')) {
+      const ask = activePoliticalEntry(politicalAsks, key);
+      if (ask) {
+        politicalAsks.delete(key);
+        const allowed = verdict === '准';
+        const grant = { remaining: POLITICAL_GRANT_TURNS, allowed, expiresAt: Date.now() + POLITICAL_GRANT_TTL_MS };
+        politicalGrants.set(key, grant);
+        if (allowed) {
+          enqueuePrompt(key, {
+            entries: [],
+            direct: false,
+            epoch: epochOf(key),
+            system: true,
+            politicalApproval: { ask, grant },
+          });
+        }
+        await sendLong(key, allowed ? '收到，我來答。' : '好，那我不答。').catch(() => {});
+        log(`政治審批 ${key}：${allowed ? '同意' : '否決'}（${POLITICAL_GRANT_TURNS} 回合）`);
+        return;
+      }
+    }
     // 有沒有在叫 bot：私聊一律算；頻道看 @ 或回覆。自由參與時沒叫 bot 的訊息也會進批次，
     // 但提問的回答只認叫 bot 的訊息。
     const keywordDirect = Boolean(guildId && cfg.discord.messageContentIntent && matchesKeywordTrigger(cfg.discord, message.channelId, rawText));
@@ -5681,7 +5742,6 @@ async function main() {
       if (!direct) return;
     }
 
-    const isOwner = ownerIds.has(message.author.id);
     const author = authorName(message);
     log(`收到 ${key}${guildId ? ` guild=${guildId}` : ''} user=${message.author.id}${direct ? '' : '（沒叫 bot）'}`);
 

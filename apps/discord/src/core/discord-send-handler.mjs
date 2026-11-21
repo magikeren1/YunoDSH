@@ -3,6 +3,7 @@
 // 抽成獨立模組是為了離線測試「純文字不算畫圖、送出失敗不算、
 // 同一個回合送多張圖只算一次對話但每張都算畫圖」。
 import path from 'node:path';
+import { stripRefusalMarker } from './discord-ignore.mjs';
 import { recordDraws, recordTriggers } from './discord-trigger-stats.mjs';
 
 const textArg = (value, max = 100) => (typeof value === 'string' ? value.trim().slice(0, max) : '');
@@ -42,7 +43,7 @@ export function createAgentSendHandler({
   }
 
   return async function send(body, { draw = true } = {}) {
-    const content = typeof body.content === 'string' ? body.content : '';
+    const content = stripRefusalMarker(typeof body.content === 'string' ? body.content : '');
     const file = textArg(body.file, 500);
     const result = await agentSender.send({
       token: body.token,

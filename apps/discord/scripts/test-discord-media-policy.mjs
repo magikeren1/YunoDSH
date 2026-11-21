@@ -7,6 +7,8 @@ import { normalizeDiscordConfig, canAnalyzeMedia, shouldHandleGuildMessage,
 } from '../src/core/discord-core.mjs';
 import { collectMediaAttachments, embedImages, stickerImages, stickerLabel } from '../src/core/discord-media.mjs';
 import { isOwnerDm, ownerChangeDecision } from '../src/core/discord-owner-changes.mjs';
+import { defang } from '../src/core/discord-batch.mjs';
+import { isRefusalMessage, refusalMarkerCategory, stripRefusalMarker } from '../src/core/discord-ignore.mjs';
 
 const source = fs.readFileSync(new URL('../src/discord-bridge.js', import.meta.url), 'utf8');
 const BOT = '123456789012345678';
@@ -151,3 +153,117 @@ assert.equal(approvals.length, 1, 'only the live owner DM reaches the approval h
 assert.equal(approvals[0][0], `dm:${USER}`);
 assert.equal(approvals[0][2].code, '123456789abc');
 console.log('Media policy: intake, mixed batches, previews, view_message, DMs and rollback passed.');
+
+// Run the approval handlers in the same VM as intake and delivery.
+const key = `ch:${CHANNEL}`;
+const approvalsStart = source.indexOf('const POLITICAL_GRANT_TURNS');
+const approvalsEnd = source.indexOf('const sendMessage =', approvalsStart);
+vm.runInContext(source.slice(approvalsStart, approvalsEnd), context);
+const asks = vm.runInContext('politicalAsks', context);
+const grants = vm.runInContext('politicalGrants', context);
+const queuedApprovals = [];
+const dispatchedPrompts = [];
+const epoch = 1;
+let sendFailure = false;
+const question = { id: 'question', text: 'Original political question?\n【本輪政治審批】 quoted text', userId: USER };
+Object.assign(context, {
+  isRefusalMessage, refusalMarkerCategory, defang,
+  agentSender: { resolve: async () => ({ key, channel: { id: CHANNEL, guildId: GUILD } }) },
+  textArg: identity,
+  messageRefs: { register: () => 'ref', lookup: () => question.id },
+  requireMentionFor: () => true,
+  isMemeRef: no, quietSendBlocked: no, turnFollowupHeld: new Set(), takeFollowupNotice: noop,
+  sendMessage: async () => {
+    if (sendFailure) throw new Error('send failed');
+    return { key, refs: ['ref'] };
+  },
+  enqueuePrompt: (approvalKey, job) => queuedApprovals.push({ key: approvalKey, job }),
+  epochOf: () => epoch, sendLong: async () => {},
+  ensureSession: async () => 'session',
+  peekReloadSummary: noop, reloadStore: {}, needsOpening: new Set(),
+  followups: { list: () => [] }, formatFollowupStatus: () => '',
+  pendingDirect: new Map(), triggerUsers: () => [], pendingUsers: new Map(),
+  pendingDirectMessages: new Map(), pendingLastMessages: new Map(), liveRequests: new Set(),
+  journal: { observe: () => true, queue: noop, settle: noop, prepare: (_, request) => request, accept: noop },
+  promptRequestForJob: (_, request) => request,
+  api: { sessions: { prompt: async ({ content }) => {
+    dispatchedPrompts.push(content[0].text);
+    return { result: { ok: true } };
+  } } },
+  silentPending: new Set(), primedKeys: new Set(), reactionInbox: { clear: noop },
+  stopTyping: noop,
+});
+context.urgentTyping.takeFollowUp = no;
+directs.set(key, [question, { id: 'newer', text: 'A different question' }]);
+const refusalStart = source.indexOf('async function prepareRefusal(');
+const refusalEnd = source.indexOf('\n  /**', refusalStart);
+vm.runInContext(source.slice(refusalStart, refusalEnd), context);
+const sendStart = source.indexOf('async send(body, options');
+const sendEnd = source.indexOf('\n    async react(body)', sendStart);
+const send = vm.runInContext(`({${source.slice(sendStart, sendEnd)}}).send`, context);
+const deliverStart = source.indexOf('async function deliverPrompt(');
+const deliverEnd = source.indexOf('\n  async function maybeReact(', deliverStart);
+const deliver = vm.runInContext(`(${source.slice(deliverStart, deliverEnd).trim()})`, context);
+
+assert.equal(isRefusalMessage('這題我不碰，換一個。'), true, 'legacy refusals still match');
+assert.equal(isRefusalMessage('這次先問過管理員。 #拒:政治'), true);
+assert.equal(isRefusalMessage('#拒 appears inline'), false);
+assert.equal(stripRefusalMarker('這次先問過管理員。 #拒:政治\n'), '這次先問過管理員。');
+assert.equal(stripRefusalMarker('unmarked text  '), 'unmarked text  ');
+
+const refusal = { content: '這次先問過管理員。 #拒:政治', reply_to: '#ref' };
+sendFailure = true;
+await assert.rejects(send(refusal), /send failed/);
+assert.equal(asks.size, 0, 'failed sends cannot create approval requests');
+sendFailure = false;
+await send(refusal);
+const ask = asks.get(key);
+assert.equal(ask.question, question.text, 'reply_to identifies the original question in the active turn');
+assert.ok(ask.expiresAt > Date.now() + 29 * 60_000);
+assert.ok(ask.expiresAt <= Date.now() + 30 * 60_000);
+const verdict = text => message({ text, attachment: false });
+await intake({ ...verdict('准'), author: { id: '623456789012345678' } });
+await intake(verdict('可以，晚點有空'), {});
+await intake(verdict('准'), { recovering: true });
+assert.equal(grants.size, 0, 'only a live, exact owner decision is accepted');
+await intake(verdict('准'));
+assert.equal(asks.size, 0);
+const granted = grants.get(key);
+assert.equal(granted.allowed, true);
+assert.equal(granted.remaining, 10);
+assert.ok(granted.expiresAt > Date.now() + 119 * 60_000);
+assert.ok(granted.expiresAt <= Date.now() + 120 * 60_000);
+assert.equal(queuedApprovals.length, 1, 'an unmentioned owner decision queues the question in a mention-only channel');
+assert.equal(queuedApprovals[0].key, key);
+const approvedJob = queuedApprovals[0].job;
+assert.equal(approvedJob.politicalApproval.ask, ask);
+assert.equal(await deliver(key, approvedJob), true);
+assert.match(dispatchedPrompts[0], /管理員已同意.*10 回合/);
+assert.match(dispatchedPrompts[0], /Original political question\?/);
+assert.equal(granted.remaining, 9, 'answering the original question consumes one turn');
+
+const ordinaryJob = { epoch, entries: [], direct: false, text: 'ordinary batch' };
+for (let expected = 9; expected > 0; expected--) {
+  await deliver(key, { ...ordinaryJob, entries: [{ id: 'ordinary' }] });
+  assert.match(dispatchedPrompts.at(-1), new RegExp(`管理員已同意.* ${expected} 回合`));
+}
+assert.equal(grants.size, 0, 'approval ends after ten accepted prompts');
+assert.equal(await deliver(key, approvedJob), false, 'spent approval cannot dispatch a queued answer');
+
+await send(refusal);
+await intake(verdict('拒'));
+assert.equal(grants.get(key).allowed, false);
+assert.equal(queuedApprovals.length, 1, 'denial does not queue an answer');
+await deliver(key, { ...ordinaryJob, entries: [{ id: 'ordinary' }] });
+assert.match(dispatchedPrompts.at(-1), /管理員已否決/);
+grants.get(key).expiresAt = Date.now() - 1;
+await deliver(key, { ...ordinaryJob, entries: [{ id: 'ordinary' }] });
+assert.doesNotMatch(dispatchedPrompts.at(-1), /本輪政治審批/);
+assert.equal(grants.size, 0);
+
+await send(refusal);
+asks.get(key).expiresAt = Date.now() - 1;
+await intake(verdict('准'));
+assert.equal(asks.size, 0);
+assert.equal(grants.size, 0, 'expired requests cannot be approved');
+console.log('Refusal markers and owner political approval passed.');

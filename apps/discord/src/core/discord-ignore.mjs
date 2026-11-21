@@ -6,7 +6,7 @@
 //     @bot 也不處理，重啟後仍然有效；控制台看得到。
 //
 // 重複拒絕：同一個人在同一個頻道短時間內一直踩線時，橋接不再送同一句罐頭拒絕，
-// 改成對他的訊息按 ❌。判斷靠 persona 裡的固定句子，改那幾句要同步 REFUSAL_LINES。
+// 改成對他的訊息按 ❌。優先看句尾的拒絕錨點，舊的固定句子仍然有效。
 import fs from 'node:fs';
 import path from 'node:path';
 import { truncateText } from '../md-to-plain.js';
@@ -29,6 +29,22 @@ const REFUSAL_LINES = new Set([
   '我就是我',
 ]);
 
+// 錨點：模型要拒絕時在訊息結尾放 #拒，可帶分類（#拒:政治）。橋接判定後由送出端剝掉，
+// 群友看不到；這樣拒絕句可以自由發揮，不用整句罐頭。
+// 只認句尾：內文提到這個記號（寫文件、貼 regex）不會被誤判成拒絕。
+const REFUSAL_MARKER_RE = /#拒(?:[:：]([^\s#]+))?\s*$/u;
+
+export function refusalMarkerCategory(text) {
+  const m = REFUSAL_MARKER_RE.exec(String(text ?? ''));
+  return m ? (m[1] ?? '') : '';
+}
+
+export function stripRefusalMarker(text) {
+  const raw = String(text ?? '');
+  const marker = REFUSAL_MARKER_RE.exec(raw);
+  return marker ? raw.slice(0, marker.index).trimEnd() : raw;
+}
+
 const cleanText = (value, max) => truncateText(String(value ?? '')
   .replace(/[\u0000-\u001f\u007f]/g, ' ')
   .replace(/\s+/g, ' ')
@@ -36,7 +52,10 @@ const cleanText = (value, max) => truncateText(String(value ?? '')
 
 /** 這一則是不是 persona 規定的固定拒絕句；是的話呼叫端可以考慮改按 ❌。 */
 export function isRefusalMessage(text) {
-  const line = String(text ?? '')
+  const raw = String(text ?? '');
+  // 錨點優先：自由發揮的拒絕也判成拒絕；舊的整句比對留著當後備。
+  if (REFUSAL_MARKER_RE.test(raw)) return true;
+  const line = raw
     .normalize('NFKC')
     // 模型常會在句尾補表情或伺服器表情（:名稱:），那些不算內容。
     .replace(/:[a-z0-9_]+:/gi, '')
