@@ -28,7 +28,7 @@
 //   的字节（那样模型只会看到一行看不懂的错误）。
 //
 // 依赖：只用 node 内置 + voice-core 的 resolveFfmpeg（ffmpeg 定位的唯一实现）。
-// 子进程一律 `stdio: 'ignore'` + 写文件：受限沙箱里 pipe 会 EPERM（见 voice-core.js 开头的说明）。
+// 子进程走文件：受限沙箱里 pipe 会 EPERM（见 voice-core.js 开头的说明）。
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -319,17 +319,18 @@ export function planAnimation(info, limits = {}) {
 // ── ffmpeg 调用 ──────────────────────────────────────────────────────────
 
 /**
- * 跑一次 ffmpeg：输入/输出都走文件，stdio 全 ignore。
+ * 跑一次 ffmpeg。串流抽格可將 stderr 寫入暫存檔，取出 HTTP 狀態碼。
  *
  * 为什么不用管道：受限沙箱里 `spawn` + stdio:'pipe' 会直接 EPERM（voice-core.js 开头有同样记录）。
- * 代价是拿不到 ffmpeg 的 stderr —— 所以调用方只报「退出码 + 动作名」，不假装能诊断具体原因。
  */
-function runFfmpeg(ffmpeg, args, { timeoutMs = MEDIA_DEFAULTS.timeoutMs } = {}) {
+function runFfmpeg(ffmpeg, args, { timeoutMs = MEDIA_DEFAULTS.timeoutMs, stderrFd = null } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
       // -nostdin：不是每個環境的 stdin 都是 /dev/null；留著會等使用者按鍵，看起來像卡死。
-      child = spawn(ffmpeg, ['-nostdin', ...args], { windowsHide: true, stdio: 'ignore' });
+      child = spawn(ffmpeg, ['-nostdin', ...args], {
+        windowsHide: true, stdio: ['ignore', 'ignore', stderrFd ?? 'ignore']
+      });
     } catch (error) {
       resolve({ ok: false, error: `ffmpeg 启动失败：${error?.message ?? error}` });
       return;
@@ -506,7 +507,9 @@ function planVideoSheet(probedSeconds, opts = {}) {
   const maxSeconds = clampInt(opts.maxVideoSeconds, 5, 120, MEDIA_DEFAULTS.maxVideoSeconds);
   // planAnimation 的 fps 下限是 0.05，6 格最多蓋住 120 秒；窗口先封頂，
   // note 才不會說「抽 6 格」卻其實只看到前面一小段。
-  const windowSeconds = Math.min(probedSeconds > 0 ? probedSeconds : wanted, maxSeconds, wanted / 0.05);
+  const windowSeconds = opts.range
+    ? opts.range.end - opts.range.start
+    : Math.min(probedSeconds > 0 ? probedSeconds : wanted, maxSeconds, wanted / 0.05);
   return {
     windowSeconds,
     layout: planAnimation({ frames: wanted, durationMs: windowSeconds * 1000 }, { gifFrames: wanted }),
@@ -514,54 +517,95 @@ function planVideoSheet(probedSeconds, opts = {}) {
 }
 
 /** 拼圖每一格大約對應第幾秒；fps 抽樣不是精確等分，所以標「約」。 */
-function frameTimesLabel(seconds, count) {
+function frameTimesLabel(seconds, count, start = 0) {
   const step = seconds / Math.max(1, count);
   const decimals = seconds < 10 ? 1 : 0;
-  const times = Array.from({ length: count }, (_, i) => (i * step).toFixed(decimals).replace(/\.0$/, ''));
+  const times = Array.from({ length: count }, (_, i) => (start + i * step).toFixed(decimals).replace(/\.0$/, ''));
   return `約 ${times.join('/')}s`;
+}
+
+const VIDEO_HTTP_HEADER_NAMES = new Map([
+  'Accept', 'Accept-Language', 'Referer', 'Sec-Fetch-Mode', 'User-Agent',
+].map((name) => [name.toLowerCase(), name]));
+
+function videoHttpInputArgs({ httpHeaders, bilibili }) {
+  const headers = new Map();
+  // 只轉送串流需要的標頭，並確保每個值都只佔一行。
+  for (const [name, value] of Object.entries(httpHeaders ?? {})) {
+    const canonical = VIDEO_HTTP_HEADER_NAMES.get(name.toLowerCase());
+    if (canonical && typeof value === 'string' && value.trim() && !/[\x00-\x1f\x7f]/.test(value)) {
+      headers.set(canonical, value);
+    }
+  }
+  if (bilibili) {
+    if (!headers.has('Referer')) headers.set('Referer', 'https://www.bilibili.com/');
+    if (!headers.has('User-Agent')) headers.set('User-Agent', 'Mozilla/5.0');
+  }
+  if (!headers.size) return [];
+  const lines = [...headers].map(([name, value]) => `${name}: ${value}\r\n`).join('');
+  return ['-headers', lines];
 }
 
 /**
  * 抽格拼圖的共同實作：input 是本機檔案或 http(s) 網址（yt-dlp 的直連串流）。
  * 失敗一律回一句可讀原因，不丟例外給呼叫端。
  */
-async function renderVideoSheet(input, opts = {}) {
+async function renderVideoSheet(input, opts, httpArgs = null) {
   const ffmpeg = resolveFfmpeg({ ffmpegPath: opts.ffmpegPath ?? null });
   const maxBytes = clampInt(opts.maxModelBytes, 64 * 1024, HARD_MAX_MODEL_BYTES, MEDIA_DEFAULTS.maxModelBytes);
   const tileWidth = clampInt(opts.gifTile, 64, 400, MEDIA_DEFAULTS.gifTile);
+  const timeoutMs = opts.timeoutMs ?? MEDIA_DEFAULTS.timeoutMs;
+  const started = Date.now();
 
   // ffprobe 問不到長度（沒裝、格式怪）就當 1 fps 取前 6 秒：短片還是看得到每一格。
   const probe = opts.duration > 0 ? { ok: true, duration: opts.duration } : await probeAudio(input, {
     ffprobePath: opts.ffprobePath || process.env.FFPROBE_PATH || 'ffprobe',
-    // 只讀檔頭，不必跟 ffmpeg 共用 25 秒的預算。
-    timeoutMs: Math.min(opts.timeoutMs ?? MEDIA_DEFAULTS.timeoutMs, 10_000),
-    tmpDir: opts.tmpDir
+    // 串流探測和抽格共用工具預算，至少留一半給抽格。
+    timeoutMs: Math.min(httpArgs ? timeoutMs / 2 : timeoutMs, 10_000),
+    tmpDir: opts.tmpDir,
+    inputArgs: httpArgs ?? []
   });
   const probed = probe.ok ? Number(probe.duration) || 0 : 0;
+  const start = opts.range?.start ?? 0;
   const { windowSeconds, layout } = planVideoSheet(probed, opts);
+  const seekArgs = start > 0 ? ['-ss', String(start)] : [];
 
   const dir = makeTempWorkspace(opts.tmpDir);
+  let stderrFd = null;
   try {
     const outFile = path.join(dir, 'strip.jpg');
     const vf = `fps=${layout.fps},scale=${tileWidth}:-1:flags=lanczos,` +
       `tile=${layout.cols}x${layout.rows}:padding=4:margin=4:color=white`;
+    if (httpArgs) stderrFd = fs.openSync(path.join(dir, 'ffmpeg-stderr.txt'), 'w+');
     const run = await runFfmpeg(ffmpeg, [
-      '-v', 'error', '-y', '-t', String(windowSeconds),
-      ...(opts.bilibili ? ['-headers', 'Referer: https://www.bilibili.com/\r\nUser-Agent: Mozilla/5.0\r\n'] : []), '-i', input,
+      '-v', httpArgs ? 'warning' : 'error', '-y', ...seekArgs, '-t', String(windowSeconds), ...(httpArgs ?? []), '-i', input,
       '-filter_complex', `[0:v]${vf}[out]`, '-map', '[out]',
       '-frames:v', '1', '-q:v', '4', outFile
-    ], { timeoutMs: opts.timeoutMs });
+    ], { stderrFd, timeoutMs: httpArgs ? Math.max(1, timeoutMs - (Date.now() - started)) : timeoutMs });
     const out = run.ok ? readIfExists(outFile) : null;
-    if (!out) return { ok: false, error: `影片抽不出畫面，${run.ok ? '輸出是空的' : run.error}` };
+    if (!out) {
+      let reason = run.ok ? '輸出是空的' : run.error;
+      let httpStatus;
+      if (stderrFd != null) {
+        // 只回傳狀態碼，避免把 stderr 裡的簽名串流網址帶進 Discord。
+        const stderr = Buffer.alloc(4096);
+        const length = fs.readSync(stderrFd, stderr, 0, stderr.length, 0);
+        httpStatus = stderr.toString('utf8', 0, length).match(/\b(?:HTTP error|Server returned) ([45]\d{2})\b/i)?.[1];
+        if (httpStatus) reason += `（HTTP ${httpStatus}）`;
+      }
+      return { ok: false, error: `影片抽不出畫面，${reason}`, httpStatus };
+    }
     if (out.length > maxBytes) {
       return { ok: false, error: `影片拼圖 ${(out.length / 1024).toFixed(0)}KB 超過 ${(maxBytes / 1024).toFixed(0)}KB 上限` };
     }
     const parts = [probed > 0 ? `影片 ${probed.toFixed(1)}s` : '影片長度不明'];
-    if (probed <= 0 || probed > windowSeconds) parts.push(`只看前 ${windowSeconds}s`);
-    parts.push(`抽 ${layout.sampleFrames} 格拼成 ${layout.cols}×${layout.rows}（${frameTimesLabel(windowSeconds, layout.sampleFrames)}，左上→右下）`);
-    parts.push('只有畫面沒有聲音');
+    if (opts.range) parts.push(`區段 ${start.toFixed(1)}–${opts.range.end.toFixed(1)}s`);
+    else if (probed <= 0 || probed > windowSeconds) parts.push(`只看前 ${windowSeconds}s`);
+    parts.push(`抽 ${layout.sampleFrames} 格拼成 ${layout.cols}×${layout.rows}（${frameTimesLabel(windowSeconds, layout.sampleFrames, start)}，左上→右下）`);
+    if (!opts.range) parts.push('只有畫面沒有聲音');
     return { ok: true, buffer: out, mimeType: 'image/jpeg', note: parts.join('，') };
   } finally {
+    if (stderrFd != null) fs.closeSync(stderrFd);
     cleanupWorkspace(dir);
   }
 }
@@ -592,7 +636,19 @@ export async function normalizeVideoForModel(buf, opts = {}) {
 export async function normalizeVideoUrlForModel(url, opts = {}) {
   const input = String(url ?? '');
   if (!/^https?:\/\//i.test(input)) return { ok: false, error: '影片網址不是 http(s)' };
-  return renderVideoSheet(input, opts);
+  return renderVideoSheet(input, opts, videoHttpInputArgs(opts));
+}
+
+/** 取出一段單聲道 PCM，交給本機語音辨識。 */
+export async function extractVideoAudio(url, outFile, opts) {
+  if (!/^https?:\/\//i.test(url)) return { ok: false, error: '音訊網址須為 http(s)' };
+  const { start, end } = opts.range;
+  // 部分 Bilibili CDN 會拒絕無上限的 Range。FFmpeg 仍只讀取轉碼需要的資料。
+  const rangeArgs = opts.bilibili ? ['-end_offset', String(1024 * 1024 * 1024)] : [];
+  return runFfmpeg(resolveFfmpeg({ ffmpegPath: opts.ffmpegPath }), [
+    '-v', 'error', '-y', '-ss', String(start), ...rangeArgs, ...videoHttpInputArgs(opts), '-i', url,
+    '-t', String(end - start), '-map', '0:a:0', '-vn', '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', outFile,
+  ], { timeoutMs: opts.timeoutMs });
 }
 
 /** 供日志/提示用的一句话摘要（不含 base64）。 */

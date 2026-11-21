@@ -7,6 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
+const BILIBILI_LINK_HOSTS = ['bilibili.com', 'www.bilibili.com', 'm.bilibili.com', 'b23.tv'];
+
 /** 可以交給 yt-dlp 的網域（精確比對）。 */
 export const VIDEO_LINK_HOSTS = Object.freeze([
   'youtube.com',
@@ -16,11 +18,12 @@ export const VIDEO_LINK_HOSTS = Object.freeze([
   'youtu.be',
   'youtube-nocookie.com',
   'www.youtube-nocookie.com',
-  'bilibili.com',
-  'www.bilibili.com',
-  'm.bilibili.com',
-  'b23.tv',
+  ...BILIBILI_LINK_HOSTS,
 ]);
+
+export function isBilibiliVideoLink(url) {
+  return URL.canParse(url) && BILIBILI_LINK_HOSTS.includes(new URL(url).hostname);
+}
 
 /** 從訊息文字挑出白名單網域的連結（去重，保持出現順序）。 */
 export function videoLinks(text) {
@@ -61,16 +64,56 @@ export const MAX_TRANSCRIPT_CHARS = 12_000;
 // 欄位子集語法：缺的欄位直接省略，輸出一定是合法 JSON。
 // 寫成 {"chapters":%(chapters)j,...} 時，沒有章節的影片會印成 "chapters":NA，整份 JSON 就壞了。
 // 也不落地整份 info.json（所有 format 網址加起來有幾十 MB）。
-const PRINT_TEMPLATE = '%(.{title,duration,chapters,description,url})j';
+const PRINT_TEMPLATE = '%(.{title,duration,chapters,description,url,http_headers})j';
+const PRINT_FORMATS = '%(formats.:.{url,http_headers,width,height,vcodec,acodec,abr})j';
+
+const isHttpStream = (format) => typeof format?.url === 'string'
+  && /^https?:\/\//i.test(format.url) && URL.canParse(format.url);
+const streamOf = (format) => ({ url: format.url, httpHeaders: format.http_headers ?? {} });
+
+function parseFormats(raw) {
+  try {
+    const formats = JSON.parse(raw);
+    return Array.isArray(formats) ? formats.filter(isHttpStream) : [];
+  } catch { return []; }
+}
+
+/** Bilibili 回傳不同 CDN 的串流時，保留一條低解析度的備援。 */
+function pickAlternateVideo(formats, primaryUrl) {
+  if (!formats.length || !URL.canParse(primaryUrl)) return null;
+  const primaryHost = new URL(primaryUrl).hostname;
+  const resolution = (format) => Math.min(format.width || Infinity, format.height || Infinity);
+  const candidate = formats.filter((format) => format.vcodec && format.vcodec !== 'none'
+    && new URL(format.url).hostname !== primaryHost).sort((a, b) => resolution(a) - resolution(b))[0];
+  return candidate ? streamOf(candidate) : null;
+}
+
+function pickAudioStreams(formats) {
+  const candidates = formats.filter((format) => format.acodec && format.acodec !== 'none')
+    .sort((a, b) => Number(b.vcodec === 'none') - Number(a.vcodec === 'none')
+      || (a.abr ?? Infinity) - (b.abr ?? Infinity));
+  if (!candidates.length) return [];
+  const first = candidates[0];
+  const host = new URL(first.url).hostname;
+  const alternate = candidates.find((format) => new URL(format.url).hostname !== host)
+    ?? candidates.find((format) => format.url !== first.url);
+  return (alternate ? [first, alternate] : [first]).map(streamOf);
+}
 
 /** yt-dlp 的 --print 輸出 → 需要的欄位。純函式，可單測。 */
-export function parseVideoMeta(raw) {
-  const line = String(raw ?? '').split(/\r?\n/).find((row) => row.trim().startsWith('{')) ?? '';
+export function parseVideoMeta(raw, { includeAudio = false } = {}) {
+  const lines = String(raw ?? '').split(/\r?\n/);
+  const line = lines.find((row) => row.trim().startsWith('{')) ?? '';
   if (!line) return null;
   try {
     const doc = JSON.parse(line);
+    const url = typeof doc.url === 'string' && /^https?:\/\//i.test(doc.url) ? doc.url : '';
+    const formats = parseFormats(lines.find((row) => /^\s*\[\s*(?:\{|\])/.test(row)));
     return {
-      url: typeof doc.url === 'string' && /^https?:\/\//i.test(doc.url) ? doc.url : '',
+      url,
+      httpHeaders: doc.http_headers ?? {},
+      alternate: pickAlternateVideo(formats, url),
+      ...(includeAudio ? { audioStreams: pickAudioStreams(formats) } : {}),
       title: typeof doc.title === 'string' ? doc.title : '',
       duration: Number.isFinite(doc.duration) ? doc.duration : 0,
       chapters: Array.isArray(doc.chapters) ? doc.chapters : [],
@@ -83,24 +126,30 @@ export function parseVideoMeta(raw) {
 
 /** 從 yt-dlp 寫出的檔名挑一條字幕。純函式，可單測。 */
 export function pickSubtitleFile(names) {
-  const files = (Array.isArray(names) ? names : []).filter((name) => /\.vtt$/i.test(String(name)));
+  const files = (Array.isArray(names) ? names : []).filter((name) => /\.(?:vtt|srt)$/i.test(String(name)));
   for (const lang of SUBTITLE_LANGS) {
-    const hit = files.find((name) => String(name).endsWith(`.${lang}.vtt`));
+    const hit = files.find((name) => String(name).endsWith(`.${lang}.vtt`))
+      ?? files.find((name) => String(name).endsWith(`.${lang}.srt`));
     if (hit) return hit;
   }
   return files.sort()[0] ?? '';
 }
 
+const cueSeconds = (value) => value.replace(',', '.').split(':').reduce((total, item) => total * 60 + Number(item), 0);
+
 /**
  * VTT → 可讀逐字稿。YouTube 自動字幕每個 cue 會把上一句再印一次，連續重複只留一次；
  * 時間軸、cue 標號、<c>／<00:00:00.000> 標籤與 HTML entity 都要去掉。
  */
-export function parseVtt(raw) {
+export function parseVtt(raw, window = null) {
   const rows = String(raw ?? '').split(/\r?\n/).map((row) => row.trim());
   const lines = [];
   let skipBlock = false;
   let atBlockStart = true;
   let seenCue = false;
+  let cueTime = '';
+  let includeCue = !window;
+  let previousText = '';
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     if (!row) { skipBlock = false; atBlockStart = true; continue; }
@@ -111,10 +160,20 @@ export function parseVtt(raw) {
     // 檔案標頭只在第一個 cue 之前略過，免得把字幕裡的「Language: …」也刪掉。
     if (!seenCue && /^(?:WEBVTT|Kind:|Language:|X-TIMESTAMP-MAP:)/i.test(row)) { atBlockStart = false; continue; }
     // 時間軸一定從時間開始；字幕內文裡的「A --> B」不該被當成時間軸。
-    if (/^[\d:.,]+\s*-->/.test(row)) { seenCue = true; atBlockStart = false; continue; }
+    const cue = row.match(/^([\d:.,]+)\s*-->\s*([\d:.,]+)/);
+    if (cue) {
+      seenCue = true;
+      atBlockStart = false;
+      if (window) {
+        cueTime = cue[1];
+        includeCue = cueSeconds(cue[2]) > (window.start ?? 0) && cueSeconds(cue[1]) < (window.end ?? Infinity);
+      }
+      continue;
+    }
     // cue 標號只有下一行是時間軸時才成立，否則「2024」這種字幕要留下來。
     if (/^\d+$/.test(row) && rows[i + 1]?.includes('-->')) { atBlockStart = false; continue; }
     atBlockStart = false;
+    if (!includeCue) { previousText = ''; continue; }
     const text = row
       .replace(/<[^>]*>/g, '')
       .replace(/&(?:nbsp|#160);/gi, ' ')
@@ -123,8 +182,9 @@ export function parseVtt(raw) {
       }[entity.toLowerCase()] ?? ' '))
       .replace(/\s+/g, ' ')
       .trim();
-    if (!text || lines[lines.length - 1] === text) continue;
-    lines.push(text);
+    if (!text || previousText === text) continue;
+    previousText = text;
+    lines.push(window ? `[${cueTime}] ${text}` : text);
   }
   return lines.join('\n');
 }
@@ -165,7 +225,7 @@ export function formatChapters(chapters, max = 20) {
  * --ignore-config 擋掉使用者設定檔的 -P（否則字幕會寫到暫存目錄外面）；
  * -I 1 讓純清單網址只處理第一支；--ignore-no-formats-error 讓抽格選不到格式時字幕仍拿得到。
  */
-export async function fetchVideoLink(url, { ytDlpPath = null, timeoutMs = 30_000 } = {}) {
+export async function fetchVideoLink(url, { ytDlpPath = null, timeoutMs = 30_000, includeAudio = false, subtitleWindow = null } = {}) {
   const bin = resolveYtDlp({ ytDlpPath });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dc-ytdlp-'));
   const outFile = path.join(dir, 'meta.json');
@@ -181,10 +241,12 @@ export async function fetchVideoLink(url, { ytDlpPath = null, timeoutMs = 30_000
         child = spawn(bin, [
           '--no-playlist', '--no-warnings', '--no-progress', '--skip-download',
           '--ignore-config', '--ignore-no-formats-error', '-I', '1',
-          '--write-subs', '--write-auto-subs', '--sub-format', 'vtt', '--sub-langs', SUB_LANGS_ARG,
+          '--write-subs', '--write-auto-subs', '--sub-format', includeAudio ? 'vtt/srt' : 'vtt', '--sub-langs', SUB_LANGS_ARG,
           // 拼圖一格才 240px 寬，360p 就夠；高位元率只是多下載時間。
           '-f', 'bv*[height<=360]/bv*[width<=360]/b[height<=360]/bv*/b',
-          '--print', PRINT_TEMPLATE, '--no-simulate',
+          '--print', PRINT_TEMPLATE,
+          ...(includeAudio || isBilibiliVideoLink(url) ? ['--print', PRINT_FORMATS] : []),
+          '--no-simulate',
           '-o', path.join(dir, 'sub.%(ext)s'),
           url,
         ], { windowsHide: true, stdio: ['ignore', outFd, errFd] });
@@ -203,9 +265,9 @@ export async function fetchVideoLink(url, { ytDlpPath = null, timeoutMs = 30_000
       child.on('close', () => { clearTimeout(timer); resolve({}); });
     });
     // --print 在字幕下載前就印出來了，逾時也可能已經有直連網址與部分字幕，先讀再判斷成敗。
-    const meta = parseVideoMeta(fs.readFileSync(outFile, 'utf8'));
+    const meta = parseVideoMeta(fs.readFileSync(outFile, 'utf8'), { includeAudio });
     const subFile = pickSubtitleFile(fs.readdirSync(dir));
-    const transcript = subFile ? parseVtt(fs.readFileSync(path.join(dir, subFile), 'utf8')) : '';
+    const transcript = subFile ? parseVtt(fs.readFileSync(path.join(dir, subFile), 'utf8'), subtitleWindow) : '';
     if (!meta && !transcript) {
       const detail = fs.readFileSync(errFile, 'utf8').split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop();
       return { ok: false, reason: result.error ?? `yt-dlp 沒給出影片資訊或字幕${detail ? `：${detail.slice(0, 120)}` : ''}` };
@@ -214,13 +276,16 @@ export async function fetchVideoLink(url, { ytDlpPath = null, timeoutMs = 30_000
     return {
       ok: true,
       url: meta?.url ?? '',
+      httpHeaders: meta?.httpHeaders ?? {},
+      alternate: meta?.alternate ?? null,
+      ...(includeAudio ? { audioStreams: meta?.audioStreams ?? [] } : {}),
       title: meta?.title ?? '',
       duration: meta?.duration ?? 0,
       chapters: meta?.chapters ?? [],
       description: meta?.description ?? '',
       transcript: clipped.text,
       transcriptTruncated: clipped.truncated,
-      transcriptLang: subFile ? String(subFile).replace(/^.*\.([^.]+)\.vtt$/i, '$1') : '',
+      transcriptLang: subFile ? String(subFile).replace(/^.*\.([^.]+)\.(?:vtt|srt)$/i, '$1') : '',
     };
   } finally {
     try { if (outFd != null) fs.closeSync(outFd); } catch {}

@@ -224,7 +224,8 @@ import {
   searchMemes,
 } from './core/discord-memes.mjs';
 import { resolvePrtsArtwork } from './core/prts-artwork.mjs';
-import { fetchVideoLink, formatChapters, formatVideoTime, videoLinks } from './core/discord-video-link.mjs';
+import { fetchVideoLink, formatChapters, formatVideoTime, isBilibiliVideoLink, videoLinks } from './core/discord-video-link.mjs';
+import { reviewVideoLink } from './core/discord-video-review.mjs';
 import { fetchTwitterImage, fetchTwitterPost, firstTwitterPost, twitterImageUrls, twitterPostLines } from './core/twitter-post.mjs';
 import { searchGifs, GIF_QUERY_MAX, GIF_RATINGS } from './core/discord-gif.mjs';
 import { resolveConsoleToken, startConsole } from './core/discord-console.mjs';
@@ -1477,6 +1478,7 @@ async function main() {
   // 這裡只負責把 #編號、表情名稱、貼圖名稱翻成 Discord 物件。
 
   const toolError = (message, statusCode) => Object.assign(new Error(message), { statusCode });
+
   const HISTORY_MAX = 50;
   const HISTORY_MAX_CHARS = 6000;
   const GIF_COOLDOWN_MS = 15 * 60_000; // GIPHY 回 429 後先停 15 分鐘，冷卻期間不再打 GIPHY
@@ -2753,6 +2755,26 @@ async function main() {
       const lines = found.map((message) => historyLine(key, message));
       return { text: `${scanScope}裡找到 ${found.length} 則（舊→新）：\n${lines.join('\n')}${note}` };
     }),
+    async reviewVideo(body) {
+      const { key, channel } = await agentSender.resolve(body.token);
+      if (!cfg.discord.videoLinks.enabled || !canAnalyzeMedia(cfg.discord, {
+        guildId: channel.guildId,
+        addressedToBot: (turnDirectMessages.get(key) ?? []).some((entry) => entry.addressedToBot),
+      })) throw toolError('這一輪未開放影片分析', 403);
+      const source = await viewSourceChannel(channel, body.channel);
+      const target = await fetchViewMessage(key, source, channel, body.message);
+      if (ignoredUser(target.author?.id)) throw toolError('這個人在你的不理名單，他的訊息不讀', 403);
+      const index = body.link_index ?? 1;
+      if (!Number.isInteger(index) || index < 1) throw toolError('link_index 要從 1 開始', 400);
+      const link = videoLinks(messageParts(target).text)[index - 1];
+      if (!link) throw toolError('找不到指定的 YouTube 或 Bilibili 影片連結', 404);
+      const result = await reviewVideoLink(link, cfg.discord.media, {
+        ytDlpPath: cfg.discord.videoLinks.ytDlpPath,
+        start: body.start_seconds, end: body.end_seconds,
+      });
+      if (result.error) throw toolError(result.error, 400);
+      return result;
+    },
     async view(body) {
       const viewStart = Date.now();
       const { key, channel } = await agentSender.resolve(body.token);
@@ -2970,9 +2992,10 @@ async function main() {
             if (!video.url) {
               lines.push('影片連結看不了畫面：yt-dlp 沒給出直連網址。');
             } else if (mediaAllowed && images.length < cfg.discord.media.maxCount) {
-              const host = new URL(linkUrl).hostname.toLowerCase();
-              const bilibili = host === 'b23.tv' || host === 'bilibili.com' || host.endsWith('.bilibili.com');
-              const sheet = await prepareVideoUrlBlock(video.url, cfg.discord.media, { timeoutMs: budget(), deadline: viewStart + 55_000, bilibili, duration: video.duration });
+              const sheet = await prepareVideoUrlBlock(video.url, cfg.discord.media, {
+                timeoutMs: budget(), deadline: viewStart + 55_000, bilibili: isBilibiliVideoLink(linkUrl),
+                duration: video.duration, httpHeaders: video.httpHeaders, alternate: video.alternate,
+              });
               if (sheet.block) {
                 images.push({ data: sheet.block.data, mimeType: sheet.block.mediaType });
                 if (sheet.note) videoNotes.push(sheet.note);

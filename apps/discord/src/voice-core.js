@@ -148,7 +148,7 @@ export function safeJoinLibrary(voiceDir, relPath) {
  * ffprobe 探测（时长/编码/sampleRate/channels）。
  * 结果写临时文件回传，stdout/stderr 一律 ignore（受限沙箱下 pipe 会 EPERM）。
  */
-export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10000, tmpDir = null } = {}) {
+export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10000, tmpDir = null, inputArgs = [] } = {}) {
   const dirs = [tmpDir, path.join(os.tmpdir(), 'voice-probe')].filter(Boolean);
   let dir = null;
   for (const d of dirs) {
@@ -164,7 +164,7 @@ export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10
         '-v', 'error',
         '-show_entries', 'format=duration,format_name',
         '-show_entries', 'stream=codec_name,codec_type,sample_rate,channels',
-        '-of', 'json', '-o', outFile, file
+        '-of', 'json', '-o', outFile, ...inputArgs, file
       ], { windowsHide: true, stdio: 'ignore' });
     } catch (error) {
       resolve({ code: -1, error: `ffprobe 启动失败：${error?.message ?? error}` });

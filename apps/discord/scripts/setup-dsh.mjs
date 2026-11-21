@@ -143,7 +143,7 @@ function mcpEntries() {
   const servers = {
     ...(DISCORD_ONLY ? {
       // 模型要自己決定什麼時候發訊息：工具打回橋接的 loopback 發送 API。
-      'mcp-discord': { serverName: 'discord', script: path.join(REPO_ROOT, 'src', 'mcp-discord.js') },
+      'mcp-discord': { serverName: 'discord', script: path.join(REPO_ROOT, 'src', 'mcp-discord.js'), toolCallTimeoutMs: 180_000 },
       // 模型自己查詞、收黑話與頻道標籤；跟 mcp-discord 共用同一個 loopback 端點。
       'mcp-slang': { serverName: 'slang', script: path.join(REPO_ROOT, 'src', 'mcp-slang.js') },
       // 模擬股票：查價、下單、持股、排行榜；身分與交易規則都在橋接。
@@ -183,7 +183,7 @@ function mcpEntries() {
         for (const [key, value] of Object.entries(s.env)) out += `          ${key}: ${yamlSingleQuote(value)}\n`;
       }
     }
-    // qq_wait_for_messages 最长可等 10 分钟；DSH 默认 60s 会提前掐断工具调用。
+    // 語音辨識與 qq_wait_for_messages 需要比 DSH 的預設 60 秒更長的預算。
     if (s.toolCallTimeoutMs) out += `        toolCallTimeoutMs: ${s.toolCallTimeoutMs}\n`;
   }
   out += '# === qq-bridge MCP END ===\n';

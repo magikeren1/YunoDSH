@@ -83,6 +83,7 @@ const DISCORD_TOOLS = [
   'mcp__discord__read_history',
   'mcp__discord__search_history',
   'mcp__discord__view_message',
+  'mcp__discord__review_video',
   'mcp__discord__user_info',
   'mcp__discord__server_info',
   'mcp__discord__conversation_stats',

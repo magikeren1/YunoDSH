@@ -44,3 +44,11 @@ sudo journalctl -u yunodsh-dsh.service -u yunodsh-discord.service
 ```
 
 DSH's journal contains its authenticated browser URL; restrict journal access accordingly. Use `sudo systemctl restart yunodsh-dsh.service` to reload DSH after applying a persona edit, or restart the Discord unit after bridge configuration changes. Use `sudo systemctl stop yunodsh-discord.service yunodsh-dsh.service` to stop both. Manage these services with systemd consistently; do not run the separate background launch helpers alongside them. `After=` controls startup order, not application readiness, so verify both service status and logs after launch.
+
+## On-demand video review
+
+Ask DSH to review a YouTube or Bilibili link in Discord, or name a time range such as “look closely at 1:10–1:35.” The `review_video` tool returns up to three timestamped contact sheets with eight sampled frames each. For long videos it spreads the sheets across the requested span. `discord.videoLinks.enabled` and the Discord media permission settings apply.
+
+The tool uses available subtitles and falls back to local Whisper speech recognition. Install `whisper-cli` and a multilingual model to enable the fallback. The bridge looks for `.tools/whisper/bin/whisper-cli` and `.tools/whisper/ggml-tiny-q5_1.bin` from the project root. `WHISPER_PATH` and `WHISPER_MODEL` in `.env` can point to other absolute paths. Audio is transcribed in segments of up to 180 seconds and the tool reports the next start time for longer selections.
+
+Build `whisper-cli` from the [Whisper.cpp release](https://github.com/ggml-org/whisper.cpp/releases) and download the [multilingual model](https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-tiny-q5_1.bin). Make both files readable by the service account and give the CLI execute permission. Refresh the Discord DSH profile with `node scripts/project.mjs init --refresh-presets` as the service account, then restart DSH and the Discord bridge to load the tool.

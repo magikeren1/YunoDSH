@@ -143,7 +143,7 @@ const CHANNEL = '444444444444444444';
 const baseCfg = () => normalizeDiscordConfig({});
 const DISCORD_TOOL_NAMES = [
   'send_message', 'send_image', 'cancel_image', 'send_prts_artwork', 'get_prts_artwork', 'send_sticker', 'add_reaction', 'remove_reaction', 'set_quiet', 'set_custom_status', 'ignore_user', 'schedule_followup', 'edit_message', 'delete_message', 'create_poll',
-  'search_emojis', 'search_stickers', 'search_gifs', 'run_script', 'read_history', 'search_history', 'view_message',
+  'search_emojis', 'search_stickers', 'search_gifs', 'run_script', 'read_history', 'search_history', 'view_message', 'review_video',
   'user_info', 'server_info', 'conversation_stats', 'remember_user', 'forget_user_fact',
   'note_event', 'search_notes', 'forget_note', 'propose_knowledge', 'save_meme', 'search_memes', 'forget_meme',
   'submit_feedback', 'list_feedback', 'edit_feedback',
@@ -3342,7 +3342,7 @@ console.log('## 7e. Discord MCP 發送工具');
         channel: '測試頻道',
         text: `來自 ${req.url}`,
         ...(req.url === '/user' ? { avatar: { data: 'iVBORw0KGgo=', mimeType: 'image/png' } } : {}),
-        ...(req.url === '/view' ? { images: [{ data: 'AAAA', mimeType: 'image/png' }, { data: 'BBBB', mimeType: 'image/jpeg' }] } : {}),
+        ...(['/view', '/reviewVideo'].includes(req.url) ? { images: [{ data: 'AAAA', mimeType: 'image/png' }, { data: 'BBBB', mimeType: 'image/jpeg' }] } : {}),
         ...(req.url === '/prtsImage' ? {
           data: 'iVBORw0KGgo=',
           mimeType: 'image/png',
@@ -3495,6 +3495,12 @@ console.log('## 7e. Discord MCP 發送工具');
     const viewed = await client.callTool({ name: 'view_message', arguments: { token: 't', message: '#k7f3ab' } });
     ok(String(viewed.content?.[0]?.text) === '來自 /view' && viewed.content.length === 3
       && viewed.content[1].type === 'image' && viewed.content[2].mimeType === 'image/jpeg', 'view_message 把橋接回的圖片全部交給模型');
+    const reviewed = await client.callTool({
+      name: 'review_video', arguments: { token: 't', message: '#k7f3ab', start_seconds: 70, end_seconds: 100 },
+    });
+    ok(received.at(-1)?.url === '/reviewVideo' && received.at(-1)?.start_seconds === 70 && received.at(-1)?.end_seconds === 100
+      && reviewed.content?.[0]?.text === '來自 /reviewVideo' && reviewed.content[2]?.mimeType === 'image/jpeg',
+    'review_video 把指定時間範圍傳給橋接，回傳文字及拼圖');
     const sentResult = await client.callTool({ name: 'send_message', arguments: { token: 't', content: '嗨' } });
     ok(String(sentResult.content?.[0]?.text).includes('#k7f3ab'), 'send_message 的結果帶送出那則的 #編號');
     const pollResult = await client.callTool({ name: 'create_poll', arguments: { token: 't', question: 'q', answers: ['a', 'b'] } });

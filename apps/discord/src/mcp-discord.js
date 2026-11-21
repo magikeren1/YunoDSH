@@ -369,6 +369,25 @@ tool(
 );
 
 tool(
+  'review_video',
+  '在對方明確要求詳細看影片時使用。讀指定 Discord 訊息裡的 YouTube 或 Bilibili 影片，回多張帶時間的抽幀拼圖與字幕。沒有字幕時用本機語音辨識。省略時間就是全片範圍，長片的畫面分段抽樣，無字幕音軌一次最多辨識 180 秒，可繼續指定下一段。要看細節時給 start_seconds 和 end_seconds。',
+  {
+    token: sessionToken,
+    message: messageRef('包含影片連結的訊息'),
+    channel: z.string().optional().describe('同一個伺服器的頻道 ID，省略就是目前頻道'),
+    link_index: z.number().int().min(1).optional().describe('該訊息中第幾條支援的影片連結，預設 1'),
+    start_seconds: z.number().nonnegative().optional().describe('從影片第幾秒開始，預設 0'),
+    end_seconds: z.number().positive().optional().describe('在影片第幾秒結束，預設片尾'),
+  },
+  '/reviewVideo',
+  (result) => [
+    { type: 'text', text: String(result.text ?? '') },
+    ...(result.images ?? []).map((image) => ({ type: 'image', data: image.data, mimeType: image.mimeType })),
+  ],
+  170_000,
+);
+
+tool(
   'user_info',
   '查某則訊息的發言者：顯示名稱、使用者名稱、身分組、加入伺服器時間、加成與禁言狀態、你記得的關於他的事，並附上他的頭像圖片。',
   {

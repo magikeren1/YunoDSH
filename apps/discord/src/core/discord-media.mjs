@@ -403,28 +403,36 @@ async function prepareMediaBlockNow(buffer, name, limits) {
 }
 
 /** yt-dlp 的直連網址 → 跟附件一樣的圖像區塊（影片抽格拼圖）。 */
-export async function prepareVideoUrlBlock(url, limits, { timeoutMs, deadline, bilibili = false, duration = 0 } = {}) {
+export async function prepareVideoUrlBlock(url, limits, { timeoutMs, deadline, ...stream } = {}) {
   return mediaQueue(() => {
     const left = deadline ? deadline - Date.now() : Infinity;
     if (left < MEDIA_QUEUE_MIN_MS) return { error: '媒體排隊太久，影片連結這次先跳過' };
     // 預算在拿到名額之後才算：排隊的時間不能白花。
     return prepareVideoUrlBlockNow(url, limits, {
-      timeoutMs: Math.max(5_000, Math.min(timeoutMs ?? 45_000, left)), bilibili, duration,
+      ...stream, timeoutMs: Math.max(5_000, Math.min(timeoutMs ?? 45_000, left)),
     });
   });
 }
 
-async function prepareVideoUrlBlockNow(url, limits, { timeoutMs, bilibili, duration } = {}) {
-  const result = await normalizeVideoUrlForModel(url, {
+async function prepareVideoUrlBlockNow(url, limits, { timeoutMs, bilibili, duration, httpHeaders, alternate, range, videoFrames }) {
+  const deadline = Date.now() + timeoutMs;
+  const options = {
     maxModelBytes: limits.maxModelBytes,
     maxVideoSeconds: limits.maxVideoSeconds,
     gifTile: 240,
-    videoFrames: 6,
-    // 呼叫端算好剩餘預算（MCP 整通只有 60 秒）；沒給就用 45 秒。
-    timeoutMs: timeoutMs ?? 45_000,
+    videoFrames: videoFrames ?? 6,
+    range,
+    timeoutMs,
     ffmpegPath: limits.ffmpegPath ?? null,
-    bilibili, duration,
-  });
+    bilibili, duration, httpHeaders,
+  };
+  let result = await normalizeVideoUrlForModel(url, options);
+  const remaining = deadline - Date.now();
+  if (result.httpStatus && alternate?.url && remaining > 0) {
+    result = await normalizeVideoUrlForModel(alternate.url, {
+      ...options, timeoutMs: remaining, httpHeaders: alternate.httpHeaders,
+    });
+  }
   if (!result.ok) return { error: result.error };
   return {
     block: {

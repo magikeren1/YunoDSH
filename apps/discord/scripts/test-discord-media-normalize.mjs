@@ -16,9 +16,13 @@ import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { spawnSync } from 'node:child_process';
+import { prepareVideoUrlBlock } from '../src/core/discord-media.mjs';
+import { parseVideoMeta, parseVtt } from '../src/core/discord-video-link.mjs';
+import { videoReviewWindows } from '../src/core/discord-video-review.mjs';
 import {
   MEDIA_DEFAULTS,
   describeImage,
+  extractVideoAudio,
   normalizeImageForModel,
   normalizeVideoForModel,
   normalizeVideoUrlForModel,
@@ -274,22 +278,106 @@ await test('影片抽不出畫面（壞檔）回錯誤，不丟例外', async ()
   assert.match(out.error, /影片抽不出畫面/);
 });
 
-await test('normalizeVideoUrlForModel：http 直連網址走同一套抽格（不落地整支片）', async () => {
+await test('詳細看影片涵蓋片尾、可縮小範圍並保留字幕時間', async () => {
+  const whole = videoReviewWindows(0, 119, 4);
+  assert.equal(whole.length, 3);
+  assert.equal(whole[0].start, 0);
+  assert.equal(whole.at(-1).end, 119);
+  assert.ok(whole.at(-1).start > 60);
+  assert.deepEqual(videoReviewWindows(75, 90, 4), [{ start: 75, end: 90 }]);
+  assert.equal(videoReviewWindows(0, 600, 4).at(-1).end, 600);
+  const vtt = 'WEBVTT\n\n01:09.000 --> 01:12.000\nbefore\n\n01:13.000 --> 01:15.000\ninside\n';
+  assert.equal(parseVtt(vtt, { start: 73, end: 80 }), '[01:13.000] inside');
+});
+
+await test('影片直連：公開串流與需要 yt-dlp 請求標頭的串流都能抽格', async () => {
   if (!hasFfmpeg) throw skip('本机没有 ffmpeg');
   const clip = path.join(tmp, 'served.mp4');
-  const made = ff(['-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=10:duration=3', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', clip]);
+  const made = ff([
+    '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=10:duration=3',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=3',
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', clip,
+  ]);
   if (made.status !== 0) throw skip('ffmpeg 生成夹具失败');
   const bytes = fs.readFileSync(clip);
+  const referer = 'https://www.bilibili.com/video/test';
+  const userAgent = 'Mozilla/5.0 TestBrowser';
+  const acceptedHeaders = { referer, 'User-Agent': userAgent, 'Sec-Fetch-Mode': 'navigate', 'Accept-Language': 'en-US', Accept: 'video/mp4' };
   const server = http.createServer((request, response) => {
+    if (request.url === '/denied.mp4') {
+      response.writeHead(403).end();
+      return;
+    }
+    if (request.url === '/audio.mp4' && !/^bytes=\d+-\d+$/.test(request.headers.range ?? '')) {
+      response.writeHead(403).end();
+      return;
+    }
+    if (request.url.startsWith('/protected.mp4') && (
+      Object.entries(acceptedHeaders).some(([name, value]) => request.headers[name.toLowerCase()] !== value)
+      || request.headers.cookie || request.headers['x-injected']
+    )) {
+      response.writeHead(403).end();
+      return;
+    }
     response.writeHead(200, { 'content-type': 'video/mp4', 'content-length': bytes.length });
     response.end(bytes);
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
-    const url = `http://127.0.0.1:${server.address().port}/clip.mp4`;
-    const out = await normalizeVideoUrlForModel(url, { ...MEDIA_DEFAULTS, tmpDir: tmp });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const out = await normalizeVideoUrlForModel(`${origin}/clip.mp4`, { ...MEDIA_DEFAULTS, tmpDir: tmp });
     assert.equal(out.ok, true, out.error);
     assert.match(out.note, /抽 6 格拼成 3×2/);
+
+    const meta = parseVideoMeta(JSON.stringify({
+      url: `${origin}/protected.mp4?token=signed-url-secret`,
+      http_headers: { ...acceptedHeaders, Cookie: 'session=private' },
+    }));
+    const sheet = await prepareVideoUrlBlock(meta.url, MEDIA_DEFAULTS, { bilibili: true, httpHeaders: meta.httpHeaders });
+    assert.equal(sheet.block?.mediaType, 'image/jpeg', sheet.error);
+    assert.match(sheet.note, /影片 3\.0s.*抽 6 格/);
+
+    const denied = await normalizeVideoUrlForModel(meta.url, {
+      ...MEDIA_DEFAULTS, tmpDir: tmp, duration: 3,
+      httpHeaders: { ...acceptedHeaders, referer: `${referer}\r\nX-Injected: yes` },
+    });
+    assert.equal(denied.ok, false);
+    assert.match(denied.error, /HTTP 403/);
+    assert.doesNotMatch(denied.error, /signed-url-secret/);
+
+    const alternate = meta.url.replace('127.0.0.1', 'localhost');
+    const primary = `${origin}/denied.mp4`;
+    const withAlternate = parseVideoMeta([
+      JSON.stringify({ url: primary, duration: 3 }),
+      JSON.stringify([
+        { url: `${origin}/clip.mp4`, vcodec: 'h264', height: 360 },
+        { url: alternate, vcodec: 'h264', height: 480, http_headers: acceptedHeaders },
+        { url: alternate.replace('/protected.mp4', '/audio.m4s'), vcodec: 'none' },
+      ]),
+    ].join('\n'));
+    assert.equal(withAlternate.alternate?.url, alternate);
+    const retried = await prepareVideoUrlBlock(primary, MEDIA_DEFAULTS, {
+      bilibili: true, duration: withAlternate.duration, alternate: withAlternate.alternate,
+    });
+    assert.equal(retried.block?.mediaType, 'image/jpeg', retried.error);
+
+    const audio = parseVideoMeta([
+      JSON.stringify({ url: primary }),
+      JSON.stringify([
+        { url: primary, vcodec: 'h264', acodec: 'none' },
+        { url: alternate, vcodec: 'none', acodec: 'aac', abr: 64, http_headers: acceptedHeaders },
+      ]),
+    ].join('\n'), { includeAudio: true });
+    assert.deepEqual(audio.audioStreams, [{ url: alternate, httpHeaders: acceptedHeaders }]);
+    const zoom = await prepareVideoUrlBlock(meta.url, MEDIA_DEFAULTS, {
+      duration: 3, httpHeaders: meta.httpHeaders, range: { start: 1, end: 3 }, videoFrames: 8,
+    });
+    assert.equal(zoom.block?.mediaType, 'image/jpeg', zoom.error);
+    assert.match(zoom.note, /區段 1\.0–3\.0s.*抽 8 格.*約 1\//);
+    const wave = path.join(tmp, 'speech.wav');
+    const speech = await extractVideoAudio(`${origin}/audio.mp4`, wave, { range: { start: 1, end: 2 }, bilibili: true });
+    assert.equal(speech.ok, true, speech.error);
+    assert.ok(fs.statSync(wave).size > 30_000);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

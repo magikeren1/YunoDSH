@@ -673,6 +673,7 @@ const PROGRESS_LABELS = {
   'mcp__discord__read_history': ['📜 翻聊天紀錄'],
   'mcp__discord__search_history': ['🔎 搜尋聊天紀錄', (args) => args.query],
   'mcp__discord__view_message': ['🔎 看一則訊息'],
+  'mcp__discord__review_video': ['🎬 分析影片'],
   'mcp__discord__user_info': ['👤 查看群友資料'],
   'mcp__discord__server_info': ['🏠 查看伺服器資訊'],
   'mcp__discord__conversation_stats': ['📊 查對話次數'],
